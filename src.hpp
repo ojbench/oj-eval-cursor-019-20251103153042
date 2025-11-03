@@ -28,10 +28,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       v_cat = v_cat_next;
     }
 
-    // Move operands to Shared Memory for computation
+    // Move operands to Shared Memory for computation (postpone V until needed)
     gpu_sim.MoveMatrixToSharedMem(current_query);
     gpu_sim.MoveMatrixToSharedMem(k_cat);
-    gpu_sim.MoveMatrixToSharedMem(v_cat);
 
     // Transpose K_cat in Shared Memory for Q * K_cat^T
     gpu_sim.Transpose(k_cat, Position::kInSharedMemory);
@@ -75,6 +74,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
 
     // Result = Softmax * V_cat  => shape (i+1, d)
+    // Move V to shared memory just-in-time to reduce peak SRAM usage
+    gpu_sim.MoveMatrixToSharedMem(v_cat);
     Matrix *answer = matrix_memory_allocator.Allocate("answer");
     gpu_sim.MatMul(soft_acc, v_cat, answer);
 
