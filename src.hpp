@@ -33,59 +33,61 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.MoveMatrixToSharedMem(k_cat);
     gpu_sim.MoveMatrixToSharedMem(v_cat);
 
-    // Transpose K_cat in Shared Memory for Q * K_cat^T
+    // Transpose K_cat in Shared Memory for Q_row * K_cat^T
     gpu_sim.Transpose(k_cat, Position::kInSharedMemory);
 
-    // S = Q * K_cat^T  => shape (i+1, i+1)
-    Matrix *score_mat = matrix_memory_allocator.Allocate("score_mat");
-    gpu_sim.MatMul(current_query, k_cat, score_mat);
-
-    // Softmax over rows of score_mat
-    Matrix *soft_acc = nullptr;
+    // Build answer row-by-row to reduce peak SRAM usage
+    Matrix *answer_acc = nullptr;
     for (size_t r = 0; r <= i; ++r) {
-      Matrix *row_r = matrix_memory_allocator.Allocate("row_r");
-      gpu_sim.GetRow(score_mat, r, row_r, Position::kInSharedMemory);
+      // q_r: 1 x d
+      Matrix *q_r = matrix_memory_allocator.Allocate("q_r");
+      gpu_sim.GetRow(current_query, r, q_r, Position::kInSharedMemory);
 
-      Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
-      gpu_sim.MatExp(row_r, row_exp);
+      // scores_r = q_r * K_cat^T: 1 x (i+1)
+      Matrix *scores_r = matrix_memory_allocator.Allocate("scores_r");
+      gpu_sim.MatMul(q_r, k_cat, scores_r);
 
-      Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
-      gpu_sim.Sum(row_exp, row_sum);
+      // softmax(scores_r)
+      Matrix *scores_exp = matrix_memory_allocator.Allocate("scores_exp");
+      gpu_sim.MatExp(scores_r, scores_exp);
+      Matrix *scores_sum = matrix_memory_allocator.Allocate("scores_sum");
+      gpu_sim.Sum(scores_exp, scores_sum);
+      Matrix *soft_r = matrix_memory_allocator.Allocate("soft_r");
+      gpu_sim.MatDiv(scores_exp, scores_sum, soft_r);
 
-      Matrix *row_soft = matrix_memory_allocator.Allocate("row_soft");
-      gpu_sim.MatDiv(row_exp, row_sum, row_soft);
+      // ans_r = soft_r * V_cat: 1 x d
+      Matrix *ans_r = matrix_memory_allocator.Allocate("ans_r");
+      gpu_sim.MatMul(soft_r, v_cat, ans_r);
 
-      // Accumulate rows vertically into soft_acc
+      // accumulate rows into answer_acc
       if (r == 0) {
-        soft_acc = matrix_memory_allocator.Allocate("softmax_mat");
-        gpu_sim.Copy(row_soft, soft_acc, Position::kInSharedMemory);
+        answer_acc = matrix_memory_allocator.Allocate("answer_acc");
+        gpu_sim.Copy(ans_r, answer_acc, Position::kInSharedMemory);
       } else {
-        Matrix *soft_next = matrix_memory_allocator.Allocate("softmax_next");
-        gpu_sim.Concat(soft_acc, row_soft, soft_next, /*axis=*/0,
+        Matrix *answer_next = matrix_memory_allocator.Allocate("answer_next");
+        gpu_sim.Concat(answer_acc, ans_r, answer_next, /*axis=*/0,
                        Position::kInSharedMemory);
-        gpu_sim.ReleaseMatrix(soft_acc);
-        soft_acc = soft_next;
+        gpu_sim.ReleaseMatrix(answer_acc);
+        answer_acc = answer_next;
       }
 
-      // Release intermediates for this row
-      gpu_sim.ReleaseMatrix(row_r);
-      gpu_sim.ReleaseMatrix(row_exp);
-      gpu_sim.ReleaseMatrix(row_sum);
-      gpu_sim.ReleaseMatrix(row_soft);
+      // Release per-row temporaries
+      gpu_sim.ReleaseMatrix(q_r);
+      gpu_sim.ReleaseMatrix(scores_r);
+      gpu_sim.ReleaseMatrix(scores_exp);
+      gpu_sim.ReleaseMatrix(scores_sum);
+      gpu_sim.ReleaseMatrix(soft_r);
+      gpu_sim.ReleaseMatrix(ans_r);
     }
 
-    // Result = Softmax * V_cat  => shape (i+1, d)
-    Matrix *answer = matrix_memory_allocator.Allocate("answer");
-    gpu_sim.MatMul(soft_acc, v_cat, answer);
-
-    // Move answer to HBM for committing
+    // Move final answer to HBM for committing
+    Matrix *answer = answer_acc;
     gpu_sim.MoveMatrixToGpuHbm(answer);
 
     // Clean up temporaries
     gpu_sim.ReleaseMatrix(k_cat);
     gpu_sim.ReleaseMatrix(v_cat);
-    gpu_sim.ReleaseMatrix(score_mat);
-    gpu_sim.ReleaseMatrix(soft_acc);
+    // k_cat currently is transposed view; release temps
 
     // Execute the queued instructions
     gpu_sim.Run(false, &matrix_memory_allocator);
